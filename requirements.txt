@@ -1,0 +1,8 @@
+streamlit
+aiohttp
+nest_asyncio
+beautifulsoup4
+pandas
+lxml
+tenacity
+orjson
