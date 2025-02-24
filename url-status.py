@@ -233,12 +233,9 @@ class URLChecker:
                                 known_sitemap_date=known_sitemap_date
                             )
             except asyncio.TimeoutError:
-                # Return a special response but also raise an exception
-                # so that we can track it if we want to recrawl later
-                return self.create_error_response(url, "Timeout", "Request timed out", is_allowed, known_sitemap_date)
+                return self.create_error_response(url, "Timeout", "Request timed out", False, known_sitemap_date)
             except Exception as e:
-                # Return the error response, but do not raise again if we want to handle it gracefully.
-                return self.create_error_response(url, "Error", str(e), is_allowed, known_sitemap_date)
+                return self.create_error_response(url, "Error", str(e), False, known_sitemap_date)
 
     async def follow_redirect_chain(self, start_url: str, headers: Dict) -> Tuple[str, int, str, Dict]:
         current_url = normalize_url(start_url)
@@ -470,6 +467,86 @@ class URLChecker:
         return ""
 
 
+async def bfs_crawl(
+    seed_url: str,
+    checker: URLChecker,
+    max_depth: Optional[int],
+    max_urls: int,
+    show_partial_callback=None,
+    sitemap_seed_pairs: List[Tuple[str, str]] = None
+) -> List[Dict]:
+    """
+    Concurrent BFS using an async queue and worker tasks.
+    Each URL is processed concurrently according to the concurrency slider.
+    Unresponsive URLs are requeued (up to max_attempts) to be recrawled at the end.
+    """
+    visited = {}  # Maps URL -> highest attempt count seen
+    results = []
+    queue = asyncio.Queue()
+    seed_url = normalize_url(seed_url.strip())
+    seed_domain = urlparse(seed_url).netloc.lower()
+
+    max_attempts = 2  # maximum attempts per URL
+
+    # Enqueue initial seed URLs (with attempt count = 1)
+    await queue.put((seed_url, "", 0, 1))
+    if sitemap_seed_pairs:
+        for (u, lm) in sitemap_seed_pairs:
+            norm = normalize_url(u)
+            if urlparse(norm).netloc.lower() == seed_domain:
+                await queue.put((norm, lm, 0, 1))
+
+    async def worker():
+        while True:
+            # Stop if we've processed enough URLs and nothing remains
+            if len(visited) >= max_urls and queue.empty():
+                break
+            try:
+                url, known_sitemap_date, depth, attempt = await queue.get()
+            except asyncio.CancelledError:
+                break
+
+            # Avoid duplicate processing if a URL has been attempted with the same or higher count.
+            if url in visited and visited[url] >= attempt:
+                queue.task_done()
+                continue
+            visited[url] = attempt
+
+            try:
+                row = await checker.fetch_and_parse(url, known_sitemap_date=known_sitemap_date)
+                results.append(row)
+                if show_partial_callback:
+                    show_partial_callback(results, len(visited), max_urls)
+
+                # If the URL failed (e.g. Timeout or Error) and we haven't hit max_attempts, requeue it.
+                if row.get("Initial_Status_Code") in ["Timeout", "Error"] and attempt < max_attempts:
+                    await queue.put((url, known_sitemap_date, depth, attempt + 1))
+                else:
+                    # If within allowed depth and the page returned OK, discover new links.
+                    if (max_depth is None or depth < max_depth) and row.get("Final_Status_Code") == 200:
+                        discovered_links = await discover_links(url, checker.session, checker.user_agent)
+                        for link in discovered_links:
+                            link_norm = normalize_url(link)
+                            if urlparse(link_norm).netloc.lower() == seed_domain:
+                                if link_norm not in visited:
+                                    await queue.put((link_norm, "", depth + 1, 1))
+            except Exception as e:
+                logging.error(f"BFS error on {url}: {e}")
+            finally:
+                queue.task_done()
+
+    # Create worker tasks equal to the chosen concurrency level.
+    workers = []
+    for _ in range(checker.max_concurrency):
+        task = asyncio.create_task(worker())
+        workers.append(task)
+
+    await queue.join()
+    for task in workers:
+        task.cancel()
+    return results
+
+
 async def discover_links(url: str, session: aiohttp.ClientSession, user_agent: str) -> List[str]:
     headers = {"User-Agent": user_agent}
     url = normalize_url(url)
@@ -486,130 +563,6 @@ async def discover_links(url: str, session: aiohttp.ClientSession, user_agent: s
         pass
     return links
 
-async def layered_bfs_crawl(
-    seed_url: str,
-    checker: URLChecker,
-    max_depth: Optional[int],
-    max_urls: int,
-    show_partial_callback=None,
-    sitemap_seed_pairs: List[Tuple[str, str]] = None
-) -> List[Dict]:
-    """
-    Layered BFS with concurrency. At each depth, gather all tasks in parallel.
-    If max_depth is None or 0 => unlimited depth.
-    """
-    visited: Set[str] = set()
-    results: List[Dict] = []
-
-    # We'll store unresponsive URLs here and recrawl them at the end.
-    # We consider them as those that result in timeouts or other errors.
-    # We'll keep a dictionary to store last known sitemap_date.
-    unresponsive_urls: List[Tuple[str, str]] = []
-
-    seed_url = normalize_url(seed_url.strip())
-    seed_domain = urlparse(seed_url).netloc.lower()
-
-    # Start BFS layering
-    current_layer = [(seed_url, "")]  # (url, known_sitemap_date)
-    depth = 0
-
-    # If user wants to include sitemap pairs as BFS seeds as well
-    if sitemap_seed_pairs:
-        # Filter those matching domain
-        domain_filtered = []
-        for (u, lm) in sitemap_seed_pairs:
-            norm = normalize_url(u)
-            if urlparse(norm).netloc.lower() == seed_domain:
-                domain_filtered.append((norm, lm))
-        current_layer.extend(domain_filtered)
-
-    while current_layer and len(visited) < max_urls:
-        next_layer = []
-        tasks = []
-        url_to_index = {}  # map index -> (url, lastmod)
-
-        for i, (url, lastmod) in enumerate(current_layer):
-            if url not in visited:
-                visited.add(url)
-                url_to_index[i] = (url, lastmod)
-
-        # create tasks for this layer
-        for idx, (url, lm) in url_to_index.items():
-            tasks.append(checker.fetch_and_parse(url, known_sitemap_date=lm))
-
-        # gather results concurrently
-        layer_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # process each result
-        for idx, res in enumerate(layer_results):
-            url, lm = url_to_index[idx]
-            if isinstance(res, dict):
-                # normal result
-                results.append(res)
-                # BFS depth check
-                # only discover links if depth < max_depth (or if no limit)
-                if (not max_depth or depth < max_depth):
-                    # parse domain
-                    final_url = res.get("Final_URL", "")
-                    # if page is HTML (status code 200?), we can discover links
-                    if res.get("Final_Status_Code") == 200:
-                        discovered_links = await discover_links(final_url, checker.session, checker.user_agent)
-                        for link in discovered_links:
-                            link_norm = normalize_url(link)
-                            if urlparse(link_norm).netloc.lower() == seed_domain:
-                                if link_norm not in visited:
-                                    next_layer.append((link_norm, ""))
-            else:
-                # error or exception
-                # we skip now, but add to unresponsive_urls to recrawl at end
-                unresponsive_urls.append((url, lm))
-
-        # partial update
-        if show_partial_callback:
-            show_partial_callback(results, len(visited), max_urls)
-
-        depth += 1
-        current_layer = next_layer
-
-        if len(visited) >= max_urls:
-            break
-
-    # BFS done, now recrawl unresponsive at the end.
-    # We'll do this in chunked parallel to avoid re-adding them to BFS.
-    # If we want multiple attempts, we can do that, but let's keep it simple.
-    # We won't BFS these unresponsive ones, just parse them again.
-    final_unresponsive = list(set(unresponsive_urls))  # remove duplicates
-    if final_unresponsive:
-        recheck_results = await recheck_unresponsive_urls(final_unresponsive, checker, show_partial_callback)
-        results.extend(recheck_results)
-
-    return results
-
-async def recheck_unresponsive_urls(url_pairs: List[Tuple[str, str]], checker: URLChecker, show_partial_callback=None) -> List[Dict]:
-    """
-    Attempt to re-check unresponsive URLs once at the end.
-    """
-    results = []
-    total = len(url_pairs)
-    tasks = []
-
-    for (u, lm) in url_pairs:
-        tasks.append(checker.fetch_and_parse(u, known_sitemap_date=lm))
-
-    chunked = [tasks[i : i + DEFAULT_CHUNK_SIZE] for i in range(0, len(tasks), DEFAULT_CHUNK_SIZE)]
-    processed = 0
-
-    for chunk in chunked:
-        chunk_results = await asyncio.gather(*chunk, return_exceptions=True)
-        for cr in chunk_results:
-            if isinstance(cr, dict):
-                results.append(cr)
-            # else: we skip if still failing
-        processed += len(chunk)
-        if show_partial_callback:
-            show_partial_callback(results, processed, total)
-
-    return results
 
 async def process_urls_chunked(
     url_pairs: List[Tuple[str, str]],
@@ -630,8 +583,13 @@ async def process_urls_chunked(
     chunks = [normalized_pairs[i : i + DEFAULT_CHUNK_SIZE] for i in range(0, len(normalized_pairs), DEFAULT_CHUNK_SIZE)]
     processed = 0
 
+    await checker.setup()
+
     for chunk in chunks:
-        tasks = [checker.fetch_and_parse(url=u, known_sitemap_date=lm) for (u, lm) in chunk]
+        tasks = [
+            checker.fetch_and_parse(url=u, known_sitemap_date=lm)
+            for (u, lm) in chunk
+        ]
         chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
         valid = [r for r in chunk_results if isinstance(r, dict)]
         results.extend(valid)
@@ -642,6 +600,7 @@ async def process_urls_chunked(
 
         gc.collect()
 
+    await checker.close()
     return results
 
 
@@ -700,12 +659,12 @@ def main():
     if input_method == "Paste":
         text_input = st.text_area("Paste URLs (space/line separated)", "")
         if text_input.strip():
-            raw_urls = re.split(r"\\s+", text_input.strip())
+            raw_urls = re.split(r"\s+", text_input.strip())
     else:
         uploaded = st.file_uploader("Upload .txt or .csv with URLs", type=["txt","csv"])
         if uploaded:
             content = uploaded.read().decode("utf-8", errors="replace")
-            raw_urls = re.split(r"\\s+", content.strip())
+            raw_urls = re.split(r"\s+", content.strip())
 
     if 'input_urls' not in st.session_state:
         st.session_state['input_urls'] = []
@@ -761,50 +720,49 @@ def main():
 
         final_results = []
 
-        loop.run_until_complete(checker.setup())
-        try:
-            if do_bfs:
-                # BFS mode requires a seed URL
-                if not bfs_seed_url.strip():
-                    st.warning("You chose BFS but didn't provide a seed URL.")
-                    return
+        if do_bfs:
+            # BFS mode requires a seed URL
+            if not bfs_seed_url.strip():
+                st.warning("You chose BFS but didn't provide a seed URL.")
+                return
 
-                # BFS Depth logic (0 => unlimited => pass None)
-                final_bfs_depth = None if bfs_depth == 0 else bfs_depth
+            # BFS Depth logic (0 => unlimited => pass None)
+            final_bfs_depth = None if bfs_depth == 0 else bfs_depth
 
-                # If user wants sitemaps included in BFS, pass them. Otherwise pass empty list.
-                sitemap_seed_pairs = st.session_state['sitemap_urls'] if include_sitemaps_in_bfs else []
+            # If user wants sitemaps included in BFS, pass them. Otherwise pass empty list.
+            sitemap_seed_pairs = st.session_state['sitemap_urls'] if include_sitemaps_in_bfs else []
 
-                final_results = loop.run_until_complete(
-                    layered_bfs_crawl(
-                        seed_url=bfs_seed_url.strip(),
-                        checker=checker,
-                        max_depth=final_bfs_depth,
-                        max_urls=DEFAULT_MAX_URLS,
-                        show_partial_callback=show_partial_data,
-                        sitemap_seed_pairs=sitemap_seed_pairs
-                    )
+            loop.run_until_complete(checker.setup())
+            final_results = loop.run_until_complete(
+                bfs_crawl(
+                    seed_url=bfs_seed_url.strip(),
+                    checker=checker,
+                    max_depth=final_bfs_depth,
+                    max_urls=DEFAULT_MAX_URLS,
+                    show_partial_callback=show_partial_data,
+                    sitemap_seed_pairs=sitemap_seed_pairs
                 )
-                progress_bar.empty()
-                status_text.write("BFS Completed!")
-            else:
-                # chunk mode
-                if not combined_pairs:
-                    st.warning("No URLs to process. Please add some URLs or a sitemap.")
-                    return
-
-                final_results = loop.run_until_complete(
-                    process_urls_chunked(
-                        combined_pairs,
-                        checker,
-                        show_partial_callback=show_partial_data
-                    )
-                )
-                progress_bar.empty()
-                status_text.write("Checks Completed!")
-        finally:
+            )
+            progress_bar.empty()
+            status_text.write("BFS Completed!")
             loop.run_until_complete(checker.close())
-            loop.close()
+        else:
+            # chunk mode
+            if not combined_pairs:
+                st.warning("No URLs to process. Please add some URLs or a sitemap.")
+                return
+
+            final_results = loop.run_until_complete(
+                process_urls_chunked(
+                    combined_pairs,
+                    checker,
+                    show_partial_callback=show_partial_data
+                )
+            )
+            progress_bar.empty()
+            status_text.write("Checks Completed!")
+
+        loop.close()
 
         if not final_results:
             st.warning("No results found.")
@@ -824,6 +782,7 @@ def main():
         )
 
         show_summary(df)
+
 
 def show_summary(df: pd.DataFrame):
     st.subheader("Summary (Optional)")
