@@ -1,1 +1,7 @@
-nest_asyncio
+streamlit
+aiohttp
+orjson
+requests
+beautifulsoup4
+lxml
+nest-asyncio
