@@ -52,9 +52,8 @@ USER_AGENTS = {
     "Custom Adidas SEO Bot": DEFAULT_USER_AGENT,
 }
 
-
 # -----------------------------
-# Helper Functions
+# Helpers
 # -----------------------------
 def normalize_url(url: str) -> str:
     """
@@ -68,7 +67,6 @@ def normalize_url(url: str) -> str:
 def parse_sitemap(url: str) -> List[str]:
     """
     Simple, synchronous fetch of a sitemap and parse <loc>.
-    For large or nested sitemaps, you'd expand this logic.
     """
     out = []
     try:
@@ -407,8 +405,9 @@ class URLChecker:
 
         return data
 
+
 # -----------------------------
-# BFS (Layer-Based)
+# BFS (Layer-Based) with Dynamic Discovered vs. Crawled
 # -----------------------------
 async def layer_bfs(
     seeds: List[str],
@@ -430,6 +429,7 @@ async def layer_bfs(
         layer_list = list(current_layer)
         current_layer.clear()
 
+        # 1) BFS fetch for the entire layer in parallel
         tasks = [checker.fetch_and_parse(u) for u in layer_list]
         layer_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -438,7 +438,7 @@ async def layer_bfs(
         for u in layer_list:
             visited.add(u)
 
-        # discover next layer
+        # 2) discover next layer
         next_layer = set()
         for row in valid:
             try:
@@ -446,11 +446,10 @@ async def layer_bfs(
                 if not final_url:
                     continue
 
-                discovered = await discover_links(final_url, checker.session, checker.user_agent)
+                discovered_links = await discover_links(final_url, checker.session, checker.user_agent)
                 base_seed = seeds[0]
-                for link in discovered:
+                for link in discovered_links:
                     link_n = normalize_url(link)
-                    # scope & filter checks
                     if not in_scope(base_seed, link_n, scope_mode):
                         continue
                     if not regex_filter(link_n, inc, exc):
@@ -461,9 +460,14 @@ async def layer_bfs(
                 logging.error(f"BFS discovery error: {e}")
                 continue
 
-        current_layer = next_layer
+        # 3) At this point, we have visited + current_layer done, and next_layer discovered
+        discovered_count = len(visited) + len(next_layer)  # approximate total discovered
+        crawled_count = len(visited)
+
         if show_partial_callback:
-            show_partial_callback(results, len(visited), DEFAULT_MAX_URLS)
+            show_partial_callback(results, crawled_count, discovered_count)
+
+        current_layer = next_layer
 
     await checker.close()
     return results
@@ -483,8 +487,9 @@ async def discover_links(url: str, session: aiohttp.ClientSession, user_agent: s
         logging.error(f"discover_links error on {url}: {e}")
     return out
 
+
 # -----------------------------
-# Chunk Mode (No BFS)
+# Chunk Mode (No BFS) with Simple Progress
 # -----------------------------
 async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callback=None) -> List[Dict]:
     results = []
@@ -521,7 +526,7 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
 # -----------------------------
 def main():
     st.set_page_config(layout="wide")
-    st.title("Three-Mode Crawler: Spider, List, or Sitemap")
+    st.title("Three-Mode Crawler with Dynamic Progress Bars")
 
     # Sidebar
     st.sidebar.header("Configuration")
@@ -541,33 +546,21 @@ def main():
 
     st.write("----")
 
-    # Initialize placeholders
-    user_urls = []
-    user_sitemaps = []
-
     if mode == "Spider (BFS)":
+        # BFS Mode
         st.subheader("Spider (BFS) Mode")
-        st.write("Enter your seed URLs below. Optionally include sitemaps.")
         text_input = st.text_area("Seed URLs (one per line)")
+        user_urls = [x.strip() for x in text_input.splitlines() if x.strip()]
 
-        if text_input.strip():
-            user_urls = [x.strip() for x in text_input.splitlines() if x.strip()]
-
-        # Option to add multiple sitemaps
         include_sitemaps = st.checkbox("Include Sitemaps? (Multiple lines allowed)")
-        sitemaps_text = ""
         user_sitemaps = []
         if include_sitemaps:
             sitemaps_text = st.text_area("Sitemap URLs", "")
             if sitemaps_text.strip():
                 raw_sitemaps = [s.strip() for s in sitemaps_text.splitlines() if s.strip()]
                 for sm in raw_sitemaps:
-                    try:
-                        parsed = parse_sitemap(sm)
-                        user_sitemaps.extend(parsed)
-                    except Exception as e:
-                        logging.error(f"Error parsing sitemap {sm}: {e}")
-                st.write(f"Collected {len(user_sitemaps)} URLs from those sitemaps.")
+                    user_sitemaps.extend(parse_sitemap(sm))
+                st.write(f"Collected {len(user_sitemaps)} URLs from sitemaps.")
 
         with st.expander("Advanced Filters (Optional)"):
             st.write("Regex to include or exclude discovered URLs in BFS.")
@@ -577,20 +570,32 @@ def main():
         if st.button("Start BFS Spider"):
             seeds = user_urls + user_sitemaps
             if not seeds:
-                st.warning("No seeds provided for BFS.")
+                st.warning("No BFS seeds provided.")
                 return
 
-            progress_ph = st.empty()
+            # Placeholders for BFS progress
+            progress_ph = st.empty()        # for the text summary
+            progress_bar = st.progress(0.0) # BFS ratio bar
             table_ph = st.empty()
-
-            def show_partial(res_list, done_count, total_count):
-                pct = int((done_count / total_count) * 100) if total_count else 100
-                progress_ph.progress(min(pct, 100))
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+
+            def show_partial_data(res_list, crawled_count, discovered_count):
+                # discovered_count can grow each iteration, so we recalc progress
+                ratio = (crawled_count / discovered_count) if discovered_count > 0 else 0
+                progress_bar.progress(ratio)
+
+                remain = discovered_count - crawled_count
+                pct = ratio * 100
+                progress_ph.write(
+                    f"Completed {crawled_count} of {discovered_count} "
+                    f"({pct:.2f}%) → {remain} Remaining"
+                )
+
+                # Show last 10 rows in a table
+                df_temp = pd.DataFrame(res_list)
+                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
@@ -600,11 +605,10 @@ def main():
                     scope_mode=scope_mode,
                     include_regex=include_pattern,
                     exclude_regex=exclude_pattern,
-                    show_partial_callback=show_partial
+                    show_partial_callback=show_partial_data
                 )
             )
             loop.close()
-            progress_ph.empty()
 
             if not results:
                 st.warning("No results from BFS.")
@@ -617,7 +621,7 @@ def main():
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
-                "Download CSV",
+                label="Download CSV",
                 data=csv_data,
                 file_name=f"bfs_{now_str}.csv",
                 mime="text/csv"
@@ -625,35 +629,42 @@ def main():
             show_summary(df)
 
     elif mode == "List":
+        # List Mode
         st.subheader("List Mode")
-        st.write("Paste URLs to crawl (no BFS).")
-        text_input = st.text_area("List of URLs")
+        list_input = st.text_area("Enter URLs (one per line)")
         if st.button("Start Crawl"):
-            user_urls = [line.strip() for line in text_input.splitlines() if line.strip()]
+            user_urls = [x.strip() for x in list_input.splitlines() if x.strip()]
             if not user_urls:
                 st.warning("No URLs provided.")
                 return
 
             progress_ph = st.empty()
+            progress_bar = st.progress(0.0)
             table_ph = st.empty()
-
-            def show_partial(res_list, done_count, total_count):
-                pct = int((done_count / total_count) * 100) if total_count else 100
-                progress_ph.progress(min(pct, 100))
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+
+            def show_partial_data(res_list, done_count, total_count):
+                ratio = done_count / total_count if total_count else 1.0
+                progress_bar.progress(ratio)
+                remain = total_count - done_count
+                pct = ratio * 100
+                progress_ph.write(
+                    f"Completed {done_count} of {total_count} "
+                    f"({pct:.2f}%) → {remain} Remaining"
+                )
+                df_temp = pd.DataFrame(res_list)
+                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
+
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
-                chunk_process(user_urls, checker, show_partial_callback=show_partial)
+                chunk_process(user_urls, checker, show_partial_callback=show_partial_data)
             )
             loop.close()
-            progress_ph.empty()
 
             if not results:
-                st.warning("No results.")
+                st.warning("No results from List Mode.")
                 return
 
             df = pd.DataFrame(results)
@@ -663,54 +674,59 @@ def main():
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
-                "Download CSV",
+                label="Download CSV",
                 data=csv_data,
                 file_name=f"list_results_{now_str}.csv",
                 mime="text/csv"
             )
             show_summary(df)
 
-    else:  # mode == "Sitemap"
+    else:
+        # Sitemap Mode
         st.subheader("Sitemap Mode")
-        st.write("Enter one or multiple sitemap URLs (one per line), parse them, and crawl those URLs in chunk mode (no BFS).")
-        text_input = st.text_area("Sitemap URLs", "")
+        st.write("Enter one or multiple sitemap URLs (one per line), then crawl them in chunk mode.")
+        sitemap_text = st.text_area("Sitemap URLs", "")
         if st.button("Fetch & Crawl Sitemaps"):
-            if not text_input.strip():
+            if not sitemap_text.strip():
                 st.warning("No sitemap URLs provided.")
                 return
 
-            lines = [l.strip() for l in text_input.splitlines() if l.strip()]
-            all_sm_urls = []
+            lines = [x.strip() for x in sitemap_text.splitlines() if x.strip()]
+            all_sitemap_urls = []
             for sm in lines:
-                parsed = parse_sitemap(sm)
-                all_sm_urls.extend(parsed)
+                all_sitemap_urls.extend(parse_sitemap(sm))
 
-            if not all_sm_urls:
+            if not all_sitemap_urls:
                 st.warning("No URLs found in these sitemaps.")
                 return
 
-            st.write(f"Collected total {len(all_sm_urls)} URLs from all sitemaps.")
-
             progress_ph = st.empty()
+            progress_bar = st.progress(0.0)
             table_ph = st.empty()
-
-            def show_partial(res_list, done_count, total_count):
-                pct = int((done_count / total_count) * 100) if total_count else 100
-                progress_ph.progress(min(pct, 100))
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+
+            def show_partial_data(res_list, done_count, total_count):
+                ratio = done_count / total_count if total_count else 1.0
+                progress_bar.progress(ratio)
+                remain = total_count - done_count
+                pct = ratio * 100
+                progress_ph.write(
+                    f"Completed {done_count} of {total_count} "
+                    f"({pct:.2f}%) → {remain} Remaining"
+                )
+                df_temp = pd.DataFrame(res_list)
+                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
+
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
-                chunk_process(all_sm_urls, checker, show_partial_callback=show_partial)
+                chunk_process(all_sitemap_urls, checker, show_partial_callback=show_partial_data)
             )
             loop.close()
-            progress_ph.empty()
 
             if not results:
-                st.warning("No results from these sitemaps.")
+                st.warning("No results from Sitemap Mode.")
                 return
 
             df = pd.DataFrame(results)
@@ -720,12 +736,13 @@ def main():
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
-                "Download CSV",
+                label="Download CSV",
                 data=csv_data,
                 file_name=f"sitemap_results_{now_str}.csv",
                 mime="text/csv"
             )
             show_summary(df)
+
 
 def show_summary(df: pd.DataFrame):
     st.subheader("Summary")
