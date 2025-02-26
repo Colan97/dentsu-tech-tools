@@ -5,17 +5,13 @@ import asyncio
 import aiohttp
 import orjson
 import nest_asyncio
-import requests
 import logging
-import time
-
 from typing import List, Dict, Set, Optional
 from urllib.parse import urlparse, urljoin, urlunparse
 from bs4 import BeautifulSoup
 from datetime import datetime
-
-# Tenacity for retry logic
 from tenacity import retry, stop_after_attempt, wait_exponential
+import xml.etree.ElementTree as ET
 
 nest_asyncio.apply()
 
@@ -65,23 +61,34 @@ def normalize_url(url: str) -> str:
     parsed = parsed._replace(fragment="")
     return urlunparse(parsed)
 
-def parse_sitemap(url: str) -> List[str]:
+async def async_parse_sitemap(url: str) -> List[str]:
     """
-    Simple, synchronous fetch of a sitemap and parse <loc>.
-    For large or nested sitemaps, you'd ideally switch to async.
+    Asynchronously fetches a sitemap URL and parses <loc> tags.
     """
     out = []
     try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(resp.text)
-            for loc_tag in root.findall(".//{*}loc"):
-                if loc_tag.text:
-                    out.append(loc_tag.text.strip())
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)) as session:
+            async with session.get(url, ssl=False) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    root = ET.fromstring(text)
+                    for loc_tag in root.findall(".//{*}loc"):
+                        if loc_tag.text:
+                            out.append(loc_tag.text.strip())
     except Exception as e:
-        logging.error(f"Sitemap parse failed for {url}: {e}")
+        logging.error(f"Async sitemap parse failed for {url}: {e}")
     return out
+
+async def process_sitemaps(sitemap_urls: List[str]) -> List[str]:
+    """
+    Processes multiple sitemap URLs concurrently and returns all discovered URLs.
+    """
+    all_urls = []
+    tasks = [async_parse_sitemap(sm) for sm in sitemap_urls]
+    results = await asyncio.gather(*tasks)
+    for r in results:
+        all_urls.extend(r)
+    return all_urls
 
 def in_scope(base_url: str, test_url: str, scope_mode: str) -> bool:
     base_parsed = urlparse(base_url)
@@ -136,7 +143,6 @@ class URLChecker:
         self.semaphore = None  # We'll create the semaphore in setup()
 
     async def setup(self):
-        # Use a high limit in TCPConnector so it doesn't cap concurrency
         connector = aiohttp.TCPConnector(
             limit=9999,  
             ttl_dns_cache=300,
@@ -153,8 +159,6 @@ class URLChecker:
             timeout=timeout_settings,
             json_serialize=orjson.dumps
         )
-
-        # Create a semaphore with concurrency set by user
         self.semaphore = asyncio.Semaphore(self.concurrency)
 
     async def close(self):
@@ -190,8 +194,7 @@ class URLChecker:
     def parse_robots_txt(self, robots_text: str, path_lower: str) -> bool:
         agent_lower = self.user_agent.lower()
         active = False
-        lines = robots_text.splitlines()
-        for line in lines:
+        for line in robots_text.splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
@@ -200,10 +203,7 @@ class URLChecker:
                 continue
             key, val = parts[0].lower(), parts[1].strip().lower()
             if key == "user-agent":
-                if val == '*' or agent_lower in val:
-                    active = True
-                else:
-                    active = False
+                active = (val == '*' or agent_lower in val)
             elif key == "disallow" and active:
                 if val and path_lower.startswith(val):
                     return False
@@ -225,10 +225,6 @@ class URLChecker:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     async def fetch_and_parse(self, url: str) -> Dict:
-        """
-        We'll wrap each request in a semaphore to limit concurrency.
-        Also includes retry logic for transient failures or timeouts.
-        """
         async with self.semaphore:
             data = {
                 "Original_URL": url,
@@ -350,34 +346,26 @@ class URLChecker:
 
     def parse_html_content(self, data: Dict, html: str, headers: Dict, status: int, is_allowed: bool) -> Dict:
         soup = BeautifulSoup(html, "lxml")
-
         title = soup.find("title")
         data["Title"] = title.get_text(strip=True) if title else ""
-
         desc = soup.find("meta", attrs={"name": "description"})
         if desc and desc.has_attr("content"):
             data["Meta_Description"] = desc["content"]
-
         h1s = soup.find_all("h1")
         data["H1_Count"] = len(h1s)
         data["H1_Text"] = h1s[0].get_text(strip=True) if h1s else ""
-
         canon = soup.find("link", attrs={"rel": "canonical"})
         if canon and canon.has_attr("href"):
             data["Canonical_URL"] = canon["href"]
-
         m_robots = soup.find("meta", attrs={"name": "robots"})
         if m_robots and m_robots.has_attr("content"):
             data["Meta_Robots"] = m_robots["content"]
         x_robots = headers.get("X-Robots-Tag", "")
         data["X_Robots_Tag"] = x_robots
-
         html_tag = soup.find("html")
         if html_tag and html_tag.has_attr("lang"):
             data["HTML_Lang"] = html_tag["lang"]
-
         data["HTTP_Last_Modified"] = headers.get("Last-Modified", "")
-
         combined = f"{data['Meta_Robots'].lower()} {x_robots.lower()}"
         if "noindex" in combined:
             data["Is_Indexable"] = "No"
@@ -391,7 +379,6 @@ class URLChecker:
         else:
             data["Is_Indexable"] = "Yes"
             data["Indexability_Reason"] = "Page is indexable"
-
         return data
 
 # -----------------------------
@@ -408,32 +395,25 @@ async def layer_bfs(
     visited: Set[str] = set()
     current_layer = set(normalize_url(u) for u in seeds if u.strip())
     results = []
-
     inc, exc = compile_filters(include_regex, exclude_regex)
-
     await checker.setup()
 
     while current_layer and len(visited) < DEFAULT_MAX_URLS:
         layer_list = list(current_layer)
         current_layer.clear()
-
         tasks = [checker.fetch_and_parse(u) for u in layer_list]
-        # Using asyncio.gather here is acceptable for BFS layer processing
         layer_results = await asyncio.gather(*tasks, return_exceptions=True)
-
         valid = [r for r in layer_results if isinstance(r, dict)]
         results.extend(valid)
         for u in layer_list:
             visited.add(u)
 
-        # Discover next layer
         next_layer = set()
         for row in valid:
             try:
                 final_url = row.get("Final_URL") or row.get("Original_URL")
                 if not final_url:
                     continue
-
                 discovered_links = await discover_links(final_url, checker.session, checker.user_agent)
                 base_seed = seeds[0]
                 for link in discovered_links:
@@ -450,13 +430,9 @@ async def layer_bfs(
 
         discovered_count = len(visited) + len(next_layer)
         crawled_count = len(visited)
-
         if show_partial_callback:
             show_partial_callback(results, crawled_count, discovered_count)
-
         current_layer = next_layer
-
-        # minor rate-limit: 0.5s after each BFS layer
         await asyncio.sleep(0.5)
 
     await checker.close()
@@ -491,7 +467,6 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
             final_list.append(nu)
 
     await checker.setup()
-
     total = len(final_list)
     processed = 0
     tasks = [checker.fetch_and_parse(u) for u in final_list]
@@ -504,7 +479,6 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
                 show_partial_callback(results, processed, total)
         except Exception as e:
             logging.error(f"Error processing: {e}")
-    
     await checker.close()
     return results
 
@@ -520,13 +494,11 @@ def main():
     ua_choice = st.sidebar.selectbox("User Agent", list(USER_AGENTS.keys()))
     user_agent = USER_AGENTS[ua_choice]
     respect_robots = st.sidebar.checkbox("Respect robots.txt", value=True)
-
     scope_mode = st.sidebar.radio(
         "Crawl Scope",
         ["Exact URL Only", "In Subfolder", "Same Subdomain", "All Subdomains"],
         index=2
     )
-
     mode = st.radio("Select Mode", ["Spider (BFS)", "List", "Sitemap"], horizontal=True)
     st.write("----")
 
@@ -534,35 +506,32 @@ def main():
         st.subheader("Spider (BFS) Mode")
         text_input = st.text_area("Seed URLs (one per line)")
         user_urls = [x.strip() for x in text_input.splitlines() if x.strip()]
-
         include_sitemaps = st.checkbox("Include Sitemaps? (Multiple lines allowed)")
         user_sitemaps = []
         if include_sitemaps:
             sitemaps_text = st.text_area("Sitemap URLs", "")
             if sitemaps_text.strip():
                 raw_sitemaps = [s.strip() for s in sitemaps_text.splitlines() if s.strip()]
-                for sm in raw_sitemaps:
-                    user_sitemaps.extend(parse_sitemap(sm))
+                # Process sitemaps asynchronously
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                user_sitemaps = loop.run_until_complete(process_sitemaps(raw_sitemaps))
+                loop.close()
                 st.write(f"Collected {len(user_sitemaps)} URLs from sitemaps.")
-
         with st.expander("Advanced Filters (Optional)"):
             st.write("Regex to include or exclude discovered URLs in BFS.")
             include_pattern = st.text_input("Include Regex", "")
             exclude_pattern = st.text_input("Exclude Regex", "")
-
         if st.button("Start BFS Spider"):
             seeds = user_urls + user_sitemaps
             if not seeds:
                 st.warning("No BFS seeds provided.")
                 return
-
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
             table_ph = st.empty()
-
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
             def show_partial_data(res_list, crawled_count, discovered_count):
                 ratio = (crawled_count / discovered_count) if discovered_count > 0 else 0
                 progress_bar.progress(ratio)
@@ -572,9 +541,7 @@ def main():
                     f"Completed {crawled_count} of {discovered_count} ({pct:.2f}%) → {remain} Remaining"
                 )
                 df_temp = pd.DataFrame(res_list)
-                # Display the full DataFrame with a fixed height for scrolling
                 table_ph.dataframe(df_temp, height=500, use_container_width=True)
-
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 layer_bfs(
@@ -587,15 +554,12 @@ def main():
                 )
             )
             loop.close()
-
             if not results:
                 st.warning("No results from BFS.")
                 return
-
             df = pd.DataFrame(results)
             st.subheader("BFS Results")
             st.dataframe(df, use_container_width=True)
-
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
@@ -614,14 +578,11 @@ def main():
             if not user_urls:
                 st.warning("No URLs provided.")
                 return
-
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
             table_ph = st.empty()
-
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
             def show_partial_data(res_list, done_count, total_count):
                 ratio = done_count / total_count if total_count else 1.0
                 progress_bar.progress(ratio)
@@ -631,23 +592,18 @@ def main():
                     f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
                 df_temp = pd.DataFrame(res_list)
-                # Display the full DataFrame with a fixed height for scrolling
                 table_ph.dataframe(df_temp, height=500, use_container_width=True)
-
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 chunk_process(user_urls, checker, show_partial_callback=show_partial_data)
             )
             loop.close()
-
             if not results:
                 st.warning("No results from List Mode.")
                 return
-
             df = pd.DataFrame(results)
             st.subheader("List Mode Results")
             st.dataframe(df, use_container_width=True)
-
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
@@ -666,23 +622,19 @@ def main():
             if not sitemap_text.strip():
                 st.warning("No sitemap URLs provided.")
                 return
-
             lines = [x.strip() for x in sitemap_text.splitlines() if x.strip()]
-            all_sitemap_urls = []
-            for sm in lines:
-                all_sitemap_urls.extend(parse_sitemap(sm))
-
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            all_sitemap_urls = loop.run_until_complete(process_sitemaps(lines))
+            loop.close()
             if not all_sitemap_urls:
                 st.warning("No URLs found in these sitemaps.")
                 return
-
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
             table_ph = st.empty()
-
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
             def show_partial_data(res_list, done_count, total_count):
                 ratio = done_count / total_count if total_count else 1.0
                 progress_bar.progress(ratio)
@@ -692,23 +644,18 @@ def main():
                     f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
                 df_temp = pd.DataFrame(res_list)
-                # Display the full DataFrame with a fixed height for scrolling
                 table_ph.dataframe(df_temp, height=500, use_container_width=True)
-
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 chunk_process(all_sitemap_urls, checker, show_partial_callback=show_partial_data)
             )
             loop.close()
-
             if not results:
                 st.warning("No results from Sitemap Mode.")
                 return
-
             df = pd.DataFrame(results)
             st.subheader("Sitemap Results")
             st.dataframe(df, use_container_width=True)
-
             csv_data = df.to_csv(index=False).encode("utf-8")
             now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
             st.download_button(
@@ -719,34 +666,21 @@ def main():
             )
             show_summary(df)
 
-
 def show_summary(df: pd.DataFrame):
     st.subheader("Summary")
-
-    if "Initial_Status_Code" in df.columns:
-        st.write("**Initial Status Code Distribution**")
-        init_counts = df["Initial_Status_Code"].value_counts(dropna=False)
-        for code, cnt in init_counts.items():
-            st.write(f"{code}: {cnt}")
-
-    if "Final_Status_Code" in df.columns:
-        st.write("**Final Status Code Distribution**")
-        final_counts = df["Final_Status_Code"].value_counts(dropna=False)
-        for code, cnt in final_counts.items():
-            st.write(f"{code}: {cnt}")
-
-    if "Is_Blocked_by_Robots" in df.columns:
-        st.write("**Blocked by Robots.txt?**")
-        block_counts = df["Is_Blocked_by_Robots"].value_counts(dropna=False)
-        for val, cnt in block_counts.items():
-            st.write(f"{val}: {cnt}")
-
-    if "Is_Indexable" in df.columns:
-        st.write("**Indexable?**")
-        indexable_counts = df["Is_Indexable"].value_counts(dropna=False)
-        for val, cnt in indexable_counts.items():
-            st.write(f"{val}: {cnt}")
-
+    if df.empty:
+        st.write("No data available for summary.")
+        return
+    def display_distribution(column_name: str, title: str):
+        if column_name in df.columns:
+            counts = df[column_name].value_counts(dropna=False).reset_index()
+            counts.columns = [column_name, "Count"]
+            st.write(f"**{title}**")
+            st.table(counts)
+    display_distribution("Initial_Status_Code", "Initial Status Code Distribution")
+    display_distribution("Final_Status_Code", "Final Status Code Distribution")
+    display_distribution("Is_Blocked_by_Robots", "Blocked by Robots.txt?")
+    display_distribution("Is_Indexable", "Indexable?")
 
 if __name__ == "__main__":
     main()
