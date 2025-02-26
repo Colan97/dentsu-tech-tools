@@ -137,7 +137,6 @@ class URLChecker:
 
     async def setup(self):
         # Use a high limit in TCPConnector so it doesn't cap concurrency
-        # We'll rely on the semaphore for concurrency control.
         connector = aiohttp.TCPConnector(
             limit=9999,  
             ttl_dns_cache=300,
@@ -419,6 +418,7 @@ async def layer_bfs(
         current_layer.clear()
 
         tasks = [checker.fetch_and_parse(u) for u in layer_list]
+        # Using asyncio.gather here is acceptable for BFS layer processing
         layer_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         valid = [r for r in layer_results if isinstance(r, dict)]
@@ -426,7 +426,7 @@ async def layer_bfs(
         for u in layer_list:
             visited.add(u)
 
-        # discover next layer
+        # Discover next layer
         next_layer = set()
         for row in valid:
             try:
@@ -492,21 +492,19 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
 
     await checker.setup()
 
-    chunk_size = 100
-    processed = 0
     total = len(final_list)
-
-    for i in range(0, total, chunk_size):
-        batch = final_list[i : i + chunk_size]
-        tasks = [checker.fetch_and_parse(u) for u in batch]
-        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
-        valid = [r for r in chunk_results if isinstance(r, dict)]
-        results.extend(valid)
-        processed += len(batch)
-
-        if show_partial_callback:
-            show_partial_callback(results, processed, total)
-
+    processed = 0
+    tasks = [checker.fetch_and_parse(u) for u in final_list]
+    for future in asyncio.as_completed(tasks):
+        try:
+            result = await future
+            results.append(result)
+            processed += 1
+            if show_partial_callback:
+                show_partial_callback(results, processed, total)
+        except Exception as e:
+            logging.error(f"Error processing: {e}")
+    
     await checker.close()
     return results
 
@@ -568,16 +566,14 @@ def main():
             def show_partial_data(res_list, crawled_count, discovered_count):
                 ratio = (crawled_count / discovered_count) if discovered_count > 0 else 0
                 progress_bar.progress(ratio)
-
                 remain = discovered_count - crawled_count
                 pct = ratio * 100
                 progress_ph.write(
-                    f"Completed {crawled_count} of {discovered_count} "
-                    f"({pct:.2f}%) → {remain} Remaining"
+                    f"Completed {crawled_count} of {discovered_count} ({pct:.2f}%) → {remain} Remaining"
                 )
-
                 df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
+                # Display the full DataFrame with a fixed height for scrolling
+                table_ph.dataframe(df_temp, height=500, use_container_width=True)
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
@@ -632,11 +628,11 @@ def main():
                 remain = total_count - done_count
                 pct = ratio * 100
                 progress_ph.write(
-                    f"Completed {done_count} of {total_count} "
-                    f"({pct:.2f}%) → {remain} Remaining"
+                    f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
                 df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
+                # Display the full DataFrame with a fixed height for scrolling
+                table_ph.dataframe(df_temp, height=500, use_container_width=True)
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
@@ -693,11 +689,11 @@ def main():
                 remain = total_count - done_count
                 pct = ratio * 100
                 progress_ph.write(
-                    f"Completed {done_count} of {total_count} "
-                    f"({pct:.2f}%) → {remain} Remaining"
+                    f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
                 df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp.tail(10), use_container_width=True)
+                # Display the full DataFrame with a fixed height for scrolling
+                table_ph.dataframe(df_temp, height=500, use_container_width=True)
 
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
