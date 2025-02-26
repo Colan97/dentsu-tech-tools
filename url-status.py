@@ -81,7 +81,7 @@ async def async_parse_sitemap(url: str) -> List[str]:
 
 async def process_sitemaps(sitemap_urls: List[str], show_partial_callback=None) -> List[str]:
     """
-    Processes multiple sitemap URLs concurrently and yields partial results as each sitemap is processed.
+    Processes multiple sitemap URLs concurrently and calls the callback as each sitemap is processed.
     """
     all_urls = []
     tasks = [async_parse_sitemap(sm) for sm in sitemap_urls]
@@ -514,14 +514,15 @@ def main():
             sitemaps_text = st.text_area("Sitemap URLs", "")
             if sitemaps_text.strip():
                 raw_sitemaps = [s.strip() for s in sitemaps_text.splitlines() if s.strip()]
-                table_ph = st.empty()
-                def show_partial_sitemap(all_urls):
-                    df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
-                    table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                user_sitemaps = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
-                loop.close()
+                with st.expander("Discovered Sitemap URLs", expanded=True):
+                    table_ph = st.empty()
+                    def show_partial_sitemap(all_urls):
+                        df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
+                        table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    user_sitemaps = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
+                    loop.close()
                 st.write(f"Collected {len(user_sitemaps)} URLs from sitemaps.")
         with st.expander("Advanced Filters (Optional)"):
             st.write("Regex to include or exclude discovered URLs in BFS.")
@@ -534,7 +535,8 @@ def main():
                 return
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
-            table_ph = st.empty()
+            with st.expander("Intermediate Results", expanded=True):
+                table_ph = st.empty()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             def show_partial_data(res_list, crawled_count, discovered_count):
@@ -585,7 +587,8 @@ def main():
                 return
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
-            table_ph = st.empty()
+            with st.expander("Intermediate Results", expanded=True):
+                table_ph = st.empty()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             def show_partial_data(res_list, done_count, total_count):
@@ -628,20 +631,22 @@ def main():
                 st.warning("No sitemap URLs provided.")
                 return
             lines = [x.strip() for x in sitemap_text.splitlines() if x.strip()]
-            table_ph = st.empty()
-            def show_partial_sitemap(all_urls):
-                df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            all_sitemap_urls = loop.run_until_complete(process_sitemaps(lines, show_partial_callback=show_partial_sitemap))
-            loop.close()
+            with st.expander("Discovered Sitemap URLs", expanded=True):
+                table_ph = st.empty()
+                def show_partial_sitemap(all_urls):
+                    df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
+                    table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                all_sitemap_urls = loop.run_until_complete(process_sitemaps(lines, show_partial_callback=show_partial_sitemap))
+                loop.close()
             if not all_sitemap_urls:
                 st.warning("No URLs found in these sitemaps.")
                 return
             progress_ph = st.empty()
             progress_bar = st.progress(0.0)
-            table_ph = st.empty()
+            with st.expander("Intermediate Results", expanded=True):
+                table_ph = st.empty()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             def show_partial_data(res_list, done_count, total_count):
