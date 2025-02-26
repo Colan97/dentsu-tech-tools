@@ -53,7 +53,7 @@ USER_AGENTS = {
 }
 
 # -----------------------------
-# Helpers
+# Helper Functions
 # -----------------------------
 def normalize_url(url: str) -> str:
     url = url.strip()
@@ -95,13 +95,10 @@ async def process_sitemaps(sitemap_urls: List[str], show_partial_callback=None) 
 def in_scope(base_url: str, test_url: str, scope_mode: str) -> bool:
     base_parsed = urlparse(base_url)
     test_parsed = urlparse(test_url)
-
     if test_parsed.scheme != base_parsed.scheme:
         return False
-
     base_netloc = base_parsed.netloc.lower()
     test_netloc = test_parsed.netloc.lower()
-
     if scope_mode == "Exact URL Only":
         return (test_url == base_url)
     elif scope_mode == "In Subfolder":
@@ -116,7 +113,6 @@ def in_scope(base_url: str, test_url: str, scope_mode: str) -> bool:
             return (test_netloc == base_netloc)
         root_domain = '.'.join(parts[-2:])
         return test_netloc.endswith(root_domain)
-
     return False
 
 def compile_filters(include_pattern: str, exclude_pattern: str):
@@ -130,6 +126,38 @@ def regex_filter(url: str, inc, exc) -> bool:
     if exc and exc.search(url):
         return False
     return True
+
+def update_redirect_label(data: Dict, original_url: str) -> Dict:
+    """
+    Updates the Final_Status_Type field according to the following rules:
+      - If final URL is the same as original URL → "No Redirect"
+      - If redirected and final status is 200 → "Redirecting to Live Page"
+      - If redirected and final status is 301/302 → "Temporary/Permanent Redirect"
+      - If redirected and final status is 404 → "Redirecting to Not Found Page"
+      - If redirected and final status is 500 → "Redirecting to Server Error Page"
+      - Otherwise, display "Status {code}"
+    """
+    final_url = data.get("Final_URL", "")
+    final_status = data.get("Final_Status_Code", "")
+    try:
+        final_code = int(final_status)
+    except Exception:
+        final_code = None
+
+    if final_url == original_url:
+        data["Final_Status_Type"] = "No Redirect"
+    else:
+        if final_code == 200:
+            data["Final_Status_Type"] = "Redirecting to Live Page"
+        elif final_code in (301, 302):
+            data["Final_Status_Type"] = "Temporary/Permanent Redirect"
+        elif final_code == 404:
+            data["Final_Status_Type"] = "Redirecting to Not Found Page"
+        elif final_code == 500:
+            data["Final_Status_Type"] = "Redirecting to Server Error Page"
+        else:
+            data["Final_Status_Type"] = f"Status {final_status}"
+    return data
 
 # -----------------------------
 # URL Checker with Semaphore
@@ -173,7 +201,6 @@ class URLChecker:
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
         path_lower = parsed.path.lower()
-
         if base not in self.robots_cache:
             rob_url = base + "/robots.txt"
             try:
@@ -187,7 +214,6 @@ class URLChecker:
             except Exception as e:
                 logging.error(f"Error fetching robots.txt for {base}: {e}")
                 self.robots_cache[base] = None
-
         content = self.robots_cache.get(base)
         if not content:
             return True
@@ -275,16 +301,22 @@ class URLChecker:
                             data["Final_Status_Code"] = init_str
                             data["Final_Status_Type"] = data["Initial_Status_Type"]
                             data["Indexability_Reason"] = "Redirect w/o Location"
+                            data = update_redirect_label(data, url)
                             return data
-                        return await self.follow_redirect_chain(url, loc, data, headers)
+                        result = await self.follow_redirect_chain(url, loc, data, headers)
+                        result = update_redirect_label(result, url)
+                        return result
                     else:
                         if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
                             content = await resp.text(errors='replace')
-                            return self.parse_html_content(data, content, resp.headers, resp.status, True)
+                            result = self.parse_html_content(data, content, resp.headers, resp.status, True)
+                            result = update_redirect_label(result, url)
+                            return result
                         else:
                             data["Final_Status_Code"] = init_str
                             data["Final_Status_Type"] = data["Initial_Status_Type"]
                             data["Indexability_Reason"] = "Non-200 or non-HTML"
+                            data = update_redirect_label(data, url)
                             return data
             except asyncio.TimeoutError:
                 data["Initial_Status_Code"] = "Timeout"
@@ -293,6 +325,7 @@ class URLChecker:
                 data["Final_Status_Code"] = "Timeout"
                 data["Final_Status_Type"] = "Request Timeout"
                 data["Indexability_Reason"] = "Timeout"
+                data = update_redirect_label(data, url)
                 return data
             except Exception as e:
                 data["Initial_Status_Code"] = "Error"
@@ -301,6 +334,7 @@ class URLChecker:
                 data["Final_Status_Code"] = "Error"
                 data["Final_Status_Type"] = str(e)
                 data["Indexability_Reason"] = "Exception"
+                data = update_redirect_label(data, url)
                 return data
 
     async def follow_redirect_chain(self, orig_url: str, location: str, data: Dict, headers: Dict) -> Dict:
@@ -319,6 +353,7 @@ class URLChecker:
                         loc2 = r2.headers.get("Location")
                         if not loc2:
                             data["Indexability_Reason"] = "Redirect w/o Location"
+                            data = update_redirect_label(data, orig_url)
                             return data
                         current_url = next_url
                         location = loc2
@@ -326,24 +361,30 @@ class URLChecker:
                     else:
                         if r2.status == 200 and r2.content_type and r2.content_type.startswith("text/html"):
                             html = await r2.text(errors='replace')
-                            return self.parse_html_content(data, html, r2.headers, r2.status, True)
+                            data = self.parse_html_content(data, html, r2.headers, r2.status, True)
+                            data = update_redirect_label(data, orig_url)
+                            return data
                         else:
                             data["Indexability_Reason"] = "Non-200 or non-HTML after redirect"
+                            data = update_redirect_label(data, orig_url)
                             return data
             except asyncio.TimeoutError:
                 data["Final_Status_Code"] = "Timeout"
                 data["Final_Status_Type"] = "Request Timeout"
                 data["Indexability_Reason"] = "Timeout in redirect chain"
+                data = update_redirect_label(data, orig_url)
                 return data
             except Exception as e:
                 data["Final_Status_Code"] = "Error"
                 data["Final_Status_Type"] = str(e)
                 data["Indexability_Reason"] = "Exception in redirect chain"
+                data = update_redirect_label(data, orig_url)
                 return data
 
         data["Indexability_Reason"] = "Redirect Loop / Exceeded"
         data["Final_Status_Code"] = "Redirect Loop"
         data["Final_Status_Type"] = "Redirect Loop"
+        data = update_redirect_label(data, orig_url)
         return data
 
     def parse_html_content(self, data: Dict, html: str, headers: Dict, status: int, is_allowed: bool) -> Dict:
@@ -519,16 +560,21 @@ def main():
                     def show_partial_sitemap(all_urls):
                         df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
                         table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                    # Start processing sitemaps concurrently
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    user_sitemaps = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
+                    # Here we immediately add seed URLs to the crawl queue
+                    # and as sitemap URLs are discovered, they can be added concurrently.
+                    sitemap_urls = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
                     loop.close()
+                    user_sitemaps = sitemap_urls
                 st.write(f"Collected {len(user_sitemaps)} URLs from sitemaps.")
         with st.expander("Advanced Filters (Optional)"):
             st.write("Regex to include or exclude discovered URLs in BFS.")
             include_pattern = st.text_input("Include Regex", "")
             exclude_pattern = st.text_input("Exclude Regex", "")
         if st.button("Start BFS Spider"):
+            # Immediately combine seed URLs with whatever sitemap URLs have been discovered so far.
             seeds = user_urls + user_sitemaps
             if not seeds:
                 st.warning("No BFS seeds provided.")
