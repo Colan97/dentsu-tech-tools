@@ -170,7 +170,7 @@ class URLChecker:
         self.respect_robots = respect_robots
         self.robots_cache = {}
         self.session = None
-        self.semaphore = None  # We'll create the semaphore in setup()
+        self.semaphore = None
 
     async def setup(self):
         connector = aiohttp.TCPConnector(
@@ -475,8 +475,8 @@ async def layer_bfs(
         crawled_count = len(visited)
         if show_partial_callback:
             show_partial_callback(results, crawled_count, discovered_count)
+        # Removed the sleep call here
         current_layer = next_layer
-        await asyncio.sleep(0.5)
 
     await checker.close()
     return results
@@ -560,11 +560,9 @@ def main():
                     def show_partial_sitemap(all_urls):
                         df_temp = pd.DataFrame(all_urls, columns=["Discovered URLs"])
                         table_ph.dataframe(df_temp, height=500, use_container_width=True)
-                    # Start processing sitemaps concurrently
+                    # Process sitemaps concurrently (partial results will update the table)
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    # Here we immediately add seed URLs to the crawl queue
-                    # and as sitemap URLs are discovered, they can be added concurrently.
                     sitemap_urls = loop.run_until_complete(process_sitemaps(raw_sitemaps, show_partial_callback=show_partial_sitemap))
                     loop.close()
                     user_sitemaps = sitemap_urls
@@ -593,8 +591,10 @@ def main():
                 progress_ph.write(
                     f"Completed {crawled_count} of {discovered_count} ({pct:.2f}%) → {remain} Remaining"
                 )
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                # Update the table every 20 URLs or when complete.
+                if crawled_count % 20 == 0 or crawled_count == discovered_count:
+                    df_temp = pd.DataFrame(res_list)
+                    table_ph.dataframe(df_temp, height=500, use_container_width=True)
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 layer_bfs(
@@ -645,8 +645,9 @@ def main():
                 progress_ph.write(
                     f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                if done_count % 20 == 0 or done_count == total_count:
+                    df_temp = pd.DataFrame(res_list)
+                    table_ph.dataframe(df_temp, height=500, use_container_width=True)
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 chunk_process(user_urls, checker, show_partial_callback=show_partial_data)
@@ -703,8 +704,9 @@ def main():
                 progress_ph.write(
                     f"Completed {done_count} of {total_count} ({pct:.2f}%) → {remain} Remaining"
                 )
-                df_temp = pd.DataFrame(res_list)
-                table_ph.dataframe(df_temp, height=500, use_container_width=True)
+                if done_count % 20 == 0 or done_count == total_count:
+                    df_temp = pd.DataFrame(res_list)
+                    table_ph.dataframe(df_temp, height=500, use_container_width=True)
             checker = URLChecker(user_agent, concurrency, DEFAULT_TIMEOUT, respect_robots)
             results = loop.run_until_complete(
                 chunk_process(all_sitemap_urls, checker, show_partial_callback=show_partial_data)
