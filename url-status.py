@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_exponential
 import xml.etree.ElementTree as ET
-import advertools as adv   # New import for advertools
+import advertools as adv   # Make sure to include advertools in requirements.txt
 
 nest_asyncio.apply()
 
@@ -88,7 +88,6 @@ async def async_parse_sitemap_advertools(url: str) -> List[str]:
     try:
         # adv.sitemap_to_df is a synchronous call.
         df = await loop.run_in_executor(None, adv.sitemap_to_df, url)
-        # Assuming the sitemap DataFrame has a 'loc' column.
         urls = df['loc'].dropna().tolist()
         return urls
     except Exception as e:
@@ -154,21 +153,28 @@ def update_redirect_label(data: Dict, original_url: str) -> Dict:
 def allowed_extension(url: str, allowed_types: set) -> bool:
     """
     Checks the URL's path against allowed content types.
+    Accepts URLs with no extension as HTML.
     """
     parsed = urlparse(url)
     path = parsed.path.lower()
     # If no allowed_types are specified, allow all.
     if not allowed_types:
         return True
-    # HTML pages: no extension or common HTML endings.
+    # For HTML: allow if path is empty, ends with a slash,
+    # ends with .html/.htm, or the last path segment has no dot.
     if 'html' in allowed_types:
-        if path == "" or path.endswith('/') or path.endswith('.html') or path.endswith('.htm'):
+        if path == "" or path.endswith('/'):
             return True
-    # Images: common image extensions.
+        if path.endswith('.html') or path.endswith('.htm'):
+            return True
+        last_segment = path.split('/')[-1]
+        if '.' not in last_segment:
+            return True
+    # For images: check common image extensions.
     if 'images' in allowed_types:
         if path.endswith(('.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp')):
             return True
-    # PDFs.
+    # For PDFs.
     if 'pdf' in allowed_types:
         if path.endswith('.pdf'):
             return True
@@ -189,7 +195,7 @@ class URLChecker:
 
     async def setup(self):
         connector = aiohttp.TCPConnector(
-            limit=9999,  
+            limit=9999,
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
             force_close=False
@@ -306,7 +312,6 @@ class URLChecker:
             headers = {"User-Agent": self.user_agent}
             try:
                 async with self.session.get(url, headers=headers, ssl=False, allow_redirects=False) as resp:
-                    # Add Content-Type field before status codes
                     data["Content_Type"] = resp.headers.get("Content-Type", "")
                     init_str = str(resp.status)
                     data["Initial_Status_Code"] = init_str
@@ -550,7 +555,7 @@ def main():
     user_agent = USER_AGENTS[ua_choice]
     respect_robots = st.sidebar.checkbox("Respect robots.txt", value=True)
     
-    # New: Content type selection
+    # Content type selection
     with st.sidebar.expander("Content Types to Crawl"):
         crawl_html = st.checkbox("HTML Pages", value=True)
         crawl_images = st.checkbox("Images", value=False)
@@ -563,7 +568,7 @@ def main():
     if crawl_pdf:
         allowed_types.add("pdf")
     
-    # New: Option to use advertools for sitemap parsing
+    # Option to use advertools for sitemap parsing
     use_advertools = st.sidebar.checkbox("Use advertools for sitemap parsing", value=False)
     
     mode = st.radio("Select Mode", ["Dynamic Frontier", "List", "Sitemap"], horizontal=True)
@@ -571,7 +576,6 @@ def main():
 
     if mode == "Dynamic Frontier":
         st.subheader("Dynamic Frontier Spider")
-        # Only one seed URL is allowed in this mode
         seed_url = st.text_input("Seed URL", placeholder="Enter a single URL")
         include_sitemaps = st.checkbox("Include Sitemaps")
         sitemap_urls = []
